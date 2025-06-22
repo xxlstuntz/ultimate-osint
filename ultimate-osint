@@ -1,0 +1,65 @@
+
+import asyncio, os, json, datetime, aiosqlite, aiohttp
+from dotenv import load_dotenv
+from jinja2 import Template
+from pathlib import Path
+
+load_dotenv()
+
+HIBP_KEY = os.getenv("HIBP_API_KEY")
+TW_BEARER = os.getenv("TWITTER_BEARER_TOKEN")
+RD_ID = os.getenv("REDDIT_CLIENT_ID")
+RD_SECRET = os.getenv("REDDIT_CLIENT_SECRET")
+RD_UA = os.getenv("REDDIT_USER_AGENT")
+G_API_KEY = os.getenv("GOOGLE_API_KEY")
+G_CSE_ID = os.getenv("GOOGLE_CSE_ID")
+
+USERNAMES = ["peytonariel", "peytonmcdowell", "peytonchisenall", "mermaidpeyton"]
+DB_FILE = "osint.sqlite"
+
+async def init_db():
+    async with aiosqlite.connect(DB_FILE) as db:
+        await db.execute("""
+            CREATE TABLE IF NOT EXISTS results(
+                id INTEGER PRIMARY KEY,
+                username TEXT,
+                source TEXT,
+                data TEXT,
+                ts DATETIME DEFAULT CURRENT_TIMESTAMP
+            );
+        """)
+        await db.commit()
+
+async def save_result(username, source, data):
+    async with aiosqlite.connect(DB_FILE) as db:
+        await db.execute(
+            "INSERT INTO results (username, source, data) VALUES (?, ?, ?)",
+            (username, source, json.dumps(data))
+        )
+        await db.commit()
+
+# Maigret skipped for iOS
+async def run_maigret(username):
+    await save_result(username, "maigret", {"status": "Skipped on iOS"})
+
+async def hibp_check(session, username):
+    headers = {"hibp-api-key": HIBP_KEY, "user-agent": "iOS-OSINT/1.0"}
+    url = f"https://haveibeenpwned.com/api/v3/breachedaccount/{username}"
+    async with session.get(url, headers=headers) as r:
+        data = await r.json() if r.status == 200 else {"status": r.status}
+        await save_result(username, "hibp", data)
+
+async def twitter_lookup(session, username):
+    headers = {"authorization": f"Bearer {TW_BEARER}"}
+    url = f"https://api.twitter.com/2/users/by/username/{username}"
+    async with session.get(url, headers=headers) as r:
+        data = await r.json()
+        await save_result(username, "twitter", data)
+
+async def reddit_search(session, username):
+    auth = aiohttp.BasicAuth(RD_ID, RD_SECRET)
+    token_resp = await session.post(
+        "https://www.reddit.com/api/v1/access_token",
+        data={"grant_type": "client_credentials"},
+        auth=auth,
+        headers={"User-Agent
