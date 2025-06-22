@@ -1,0 +1,125 @@
+import asyncio, os, json, datetime, aiosqlite, aiohttp
+from dotenv import load_dotenv
+from jinja2 import Template
+from pathlib import Path
+
+load_dotenv()
+
+# === API KEYS ===
+HIBP_KEY = os.getenv("HIBP_API_KEY")
+TW_BEARER = os.getenv("TWITTER_BEARER_TOKEN")
+RD_ID = os.getenv("REDDIT_CLIENT_ID")
+RD_SECRET = os.getenv("REDDIT_CLIENT_SECRET")
+RD_UA = os.getenv("REDDIT_USER_AGENT")
+G_API_KEY = os.getenv("GOOGLE_API_KEY")
+G_CSE_ID = os.getenv("GOOGLE_CSE_ID")
+
+USERNAMES = ["peytonariel", "peytonmcdowell", "peytonchisenall", "mermaidpeyton"]
+DB_FILE = "osint.sqlite"
+
+# === DB SETUP ===
+CREATE_SQL = """
+CREATE TABLE IF NOT EXISTS results(
+   id INTEGER PRIMARY KEY,
+   username TEXT,
+   source TEXT,
+   data TEXT,
+   ts DATETIME DEFAULT CURRENT_TIMESTAMP
+);
+"""
+
+async def init_db():
+    async with aiosqlite.connect(DB_FILE) as db:
+        await db.execute(CREATE_SQL)
+        await db.commit()
+
+async def save_result(username, source, data):
+    async with aiosqlite.connect(DB_FILE) as db:
+        await db.execute(
+            "INSERT INTO results (username, source, data) VALUES (?,?,?)",
+            (username, source, json.dumps(data))
+        )
+        await db.commit()
+
+# === HIBP ===
+async def hibp_check(session, username):
+    headers = {"hibp-api-key": HIBP_KEY, "user-agent": "UltimateOSINT-iOS"}
+    url = f"https://haveibeenpwned.com/api/v3/breachedaccount/{username}"
+    async with session.get(url, headers=headers) as r:
+        if r.status == 200:
+            data = await r.json()
+        else:
+            data = {"error": r.status}
+    await save_result(username, "hibp", data)
+
+# === Twitter Lookup ===
+async def twitter_lookup(session, username):
+    headers = {"Authorization": f"Bearer {TW_BEARER}"}
+    url = f"https://api.twitter.com/2/users/by/username/{username}"
+    async with session.get(url, headers=headers) as r:
+        data = await r.json()
+    await save_result(username, "twitter", data)
+
+# === Reddit Mentions ===
+async def reddit_search(session, username):
+    auth = aiohttp.BasicAuth(RD_ID, RD_SECRET)
+    token = await (await session.post(
+        "https://www.reddit.com/api/v1/access_token",
+        data={"grant_type": "client_credentials"},
+        auth=auth,
+        headers={"User-Agent": RD_UA})
+    ).json()
+    bearer = {"Authorization": f"bearer {token['access_token']}", "User-Agent": RD_UA}
+    url = f"https://oauth.reddit.com/search?q={username}&limit=5"
+    async with session.get(url, headers=bearer) as r:
+        data = await r.json()
+    await save_result(username, "reddit", data)
+
+# === Google CSE ===
+async def google_cse(session, username):
+    url = f"https://www.googleapis.com/customsearch/v1?q={username}&key={G_API_KEY}&cx={G_CSE_ID}&num=3"
+    async with session.get(url) as r:
+        data = await r.json()
+    await save_result(username, "google", data)
+
+# === HTML Report ===
+REPORT_TEMPLATE = """
+<h1>Ultimate OSINT Report — {{ ts }}</h1>
+{% for user, entries in grouped.items() %}
+  <h2>{{ user }}</h2>
+  {% for source, data in entries %}
+    <h3>{{ source }}</h3>
+    <pre>{{ data|e }}</pre>
+  {% endfor %}
+{% endfor %}
+"""
+
+async def make_report():
+    grouped = {}
+    async with aiosqlite.connect(DB_FILE) as db:
+        async with db.execute("SELECT username, source, data FROM results") as cur:
+            async for user, src, dat in cur:
+                grouped.setdefault(user, []).append((src, json.loads(dat)))
+    html = Template(REPORT_TEMPLATE).render(ts=datetime.datetime.utcnow(), grouped=grouped)
+    Path("report.html").write_text(html)
+    print("✅ Report saved as report.html")
+
+# === Main Orchestrator ===
+async def gather_for(username):
+    async with aiohttp.ClientSession() as session:
+        await asyncio.gather(
+            hibp_check(session, username),
+            twitter_lookup(session, username),
+            reddit_search(session, username),
+            google_cse(session, username)
+        )
+
+async def main():
+    await init_db()
+    for user in USERNAMES:
+        print(f"🔍 Scanning: {user}")
+        await gather_for(user)
+    await make_report()
+
+if __name__ == "__main__":
+    asyncio.run(main())
